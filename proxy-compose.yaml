@@ -103,10 +103,8 @@ services:
       - ${PROXY_CFG_DIR}/traefik:/letsencrypt
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.dashboard.tls.certresolver=cloudflare"
       - "traefik.http.routers.dashboard.entrypoints=websecure"
       - "traefik.http.routers.dashboard.service=api@internal"
-      #- "traefik.http.routers.dashboard.tls=true"
 
       # Define the subdomain traefik will use and the port it will proxy
       - "traefik.http.routers.dashboard.rule=Host(`traefik.${MY_DOMAIN}`)"
