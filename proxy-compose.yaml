@@ -1,0 +1,222 @@
+
+# I define networks first, because I keep sets of containers on their own networks. 
+# If they don't need to talk, they can't. 
+# Only the Tailscale container gets access to all networks because it's the entrypoint.
+# You can dump everything on one network if you want. 
+networks:
+  servicenet:
+    external: true
+# Some other networks here...
+  void_backend:
+    internal: true
+  void_frontend:
+    internal: true
+  traefik_socket:
+    internal: true
+services:
+  proxy-tailscale:
+    image: tailscale/tailscale:latest
+    container_name: proxy-tailscale
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY} 
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_HOSTNAME=proxy-tailscale
+      - TS_ACCEPT_DNS=false # Enabling TS DNS here will break docker hostnames, no fun
+      - TS_USERSPACE=false" # Disable userspace to improve performance (trust me)
+
+    # I leave ports here, but commented out for reference 
+    # and troubleshooting if necessary. 
+    # ports:
+    #   - "8016:80"
+    #   - "8068:8080"
+    #   - "4643:443"
+    volumes:
+      - ${PROXY_CFG_DIR}/tailscale:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      - servicenet
+      - void_frontend # Trafik runs its network here, so the void network goes here
+      - traefik_socket
+  
+  socket-proxy:
+    image: ghcr.io/wollomatic/socket-proxy:1
+    container_name: socket-proxy
+    restart: unless-stopped
+    group_add:
+      - ${DOCKER_GID}
+    command:
+      - '-allowGET=/v1\..{1,2}/(version|containers/.*|events.*)' 
+      - "-allowfrom=proxy-tailscale"
+      - "-listenip=0.0.0.0"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro 
+    networks:
+      - traefik_socket
+
+  traefik:
+    image: traefik:v3.7
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - "--serversTransport.insecureSkipVerify=true"
+      - "--log.level=debug"
+      # EntryPoints
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.websecure.http.tls=true"
+      - "--entrypoints.websecure.http.tls.certresolver=cloudflare"
+
+      # Providers 
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.endpoint=tcp://socket-proxy:2375"
+
+      # API & Dashboard 
+      - '--api=true'
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+
+
+      # Let's Encrypt configuration
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.cloudflare.acme.email=${CLOUDFLARE_EMAIL}"
+      - "--certificatesresolvers.cloudflare.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.cloudflare.acme.dnschallenge.delaybeforecheck=0"
+    environment:
+      - CF_DNS_API_TOKEN=${CLOUDFLARE_TOKEN}  
+    # ports:
+    #   - "80:80"
+    #   - "8080:8080"
+    #   - "443:443"
+    volumes:
+      - ${PROXY_CFG_DIR}/traefik:/letsencrypt
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.tls.certresolver=cloudflare"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      #- "traefik.http.routers.dashboard.tls=true"
+
+      # Define the subdomain traefik will use and the port it will proxy
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.${MY_DOMAIN}`)"
+      - "traefik.http.services.traefik.loadbalancer.server.port=8080"
+
+      # Comment this out to disable Void Auth. Not recommended for the dashboard.
+      - "traefik.http.routers.dashboard.middlewares=voidauth@docker"
+
+    # Attach Traefik to the Tailscale container
+    # and make sure it waits until TS, Void, and the socket proxy are started
+    network_mode: "container:proxy-tailscale"
+    depends_on:
+      proxy-tailscale:
+        condition: service_started
+      voidauth:
+        condition: service_healthy
+      socket-proxy:
+        condition: service_started
+
+
+  voidauth:
+    image: voidauth/voidauth:latest
+    container_name: voidauth
+    restart: unless-stopped
+    # ports:
+    #   - "3000:3000"
+    volumes:
+      - ${PROXY_CFG_DIR}/voidauth/config:/app/config
+    environment:
+      - APP_URL=https://void.${MY_DOMAIN}
+      - SIGNUP=false
+      - SIGNUP_REQUIRES_APPROVAL=true
+      - EMAIL_VERIFICATION=false=
+      - APP_TITLE:=VoidAuth
+      - APP_COLOR:=#906bc7
+      - DB_HOST=postgres-void
+      - DB_PORT=5432
+      - DB_PASSWORD=${VOID_DB_PASSWORD}
+      - STORAGE_KEY=${VOID_KEY1}
+      - STORAGE_KEY_SECONDARY=${VOID_KEY2}
+      - PASSWORD_STRENGTH=3
+      - APP_PORT=3000
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/healthcheck').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.voidauth.rule=Host(`void.${MY_DOMAIN}`)"
+      - "traefik.http.routers.voidauth.entrypoints=websecure"
+      - "traefik.http.middlewares.voidauth.forwardAuth.address=http://voidauth:3000/api/authz/forward-auth"
+      - "traefik.http.middlewares.voidauth.forwardAuth.trustForwardHeader=true"
+      - "traefik.http.middlewares.voidauth.forwardAuth.authResponseHeaders=Remote-User,Remote-Name,Remote-Email,Remote-Groups"
+      - "traefik.http.services.voidauth.loadbalancer.server.port=3000"
+      - "traefik.docker.network=docker_void_frontend"
+    depends_on:
+      postgres-void:
+        condition: service_healthy
+    networks:
+      - void_backend
+      - void_frontend
+
+
+  postgres-void:
+    image: postgres:18
+    container_name: postgres-void
+    restart: unless-stopped
+    # ports:
+    #   - "5432:5432"
+    environment:
+      - POSTGRES_PASSWORD=${VOID_DB_PASSWORD}
+    volumes:
+      - ${PROXY_CFG_DIR}/postgres-void:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+    networks:
+      - void_backend
+
+  dozzle:
+    image: amir20/dozzle
+    container_name: dozzle
+    restart: unless-stopped
+    # ports: 
+    #   - "8080:8080"
+    environment:
+      - DOZZLE_BASE=/
+      - DOZZLE_LEVEL=info
+      - DOZZLE_TAILSIZE=300
+      - DOZZLE_KEY=${DOZZLE_KEY}
+      - DOZZLE_NO_ANALYTICS=true     
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - servicenet
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dozzle.entrypoints=websecure"
+
+      # Set the subdomain here 
+      - "traefik.http.routers.dozzle.rule=Host(`dozzle.${MY_DOMAIN}`)"
+
+      # Set the network that traefik can find this container on
+      # along with the port to proxy to
+      - "traefik.docker.network=servicenet"
+      - "traefik.http.services.dozzle.loadbalancer.server.port=8080"
+
+      # This enables VoidAuth
+      - "traefik.http.routers.dozzle.middlewares=voidauth@docker"
